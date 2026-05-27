@@ -1,313 +1,382 @@
 ---
 name: ecforce
-description: ecforce (EC構築プラットフォーム) の管理 API 連携ナレッジ。認証ヘッダー仕様、トークン管理、顧客一括更新エンドポイント、受注検索 / 決済再処理 (void / reauth / 支払い方法変更) / 顧客メモ / 倉庫連携待ち遷移、`tbc` (要対応) フラグが API では書けないこと、自動化ルールと GET ポーリングでの整合性確保、よくある落とし穴をまとめる。ecforce にリクエストを送る／ecforce から webhook を受ける処理を実装・デバッグするときに読む。
+description: ecforce 管理 API (`/api/v2/admin`) を叩くときに参照する規約集。認証ヘッダー (`Token token="..."`)、JSON:API レスポンス、受注検索 (`GET /orders.json`)、決済再処理 (`bulk_update method=void|reauth`)、支払い方法変更・注文確定・倉庫連携待ち (`PUT /orders/:id`)、顧客一括更新 (`PUT /customers/bulk_update`)、顧客メモ追加 (`PUT /customers/:id` の `notes_attributes`)、`tbc` (要対応) が API では書き込めず管理画面の自動化ルール + GET ポーリングで反映を待つ必要があること、与信審査ポーリング、レート制御・リトライ、`payment_state` 値辞書をカバー。ecforce へ HTTP を出す/受ける実装・デバッグの前に必ず読む。
 ---
 
-# ecforce API 連携スキル
+# ecforce API スキル (AI 向け仕様)
 
-このスキルは「ecforce の管理 API を別システムから叩く」ときに繰り返し必要になる
-事実をまとめたもの。エンドポイント単位の細かい仕様は ecforce 公式ドキュメントが
-正だが、ここには「ドキュメントを毎回読み返さなくても動くまで持っていける」だけの
-最低限を置く。新しい知見が出たらこの SKILL.md（中央リポジトリ側）を更新する。
+このドキュメントは LLM エージェントが ecforce 管理 API を叩く前に参照する規約。
+散文より「規則」「テーブル」「コードブロック」を優先する。新しい実機検証で
+得た事実は追記する。**矛盾が生じたら新しい実機検証側を正とする**。
 
-## 認証
+---
 
-- 認証ヘッダーの形式は **`Authorization: Token token="<API_TOKEN>"`** （Rails の
-  `acts_as_token_authenticatable` 系の標準）。`Bearer` ではない点に注意。
-- トークンは ecforce の管理画面で API ユーザーごとに発行する。失効・ローテーションは
-  管理画面側の操作なので、システム側はトークンを 1 環境変数で扱えれば十分。
-- ストレージ：必ずシークレット（Replit Secrets 等）に置く。DB やコードに直書きしない。
-  推奨の env 名：`ECFORCE_API_TOKEN`。
-  - 別プロジェクト（決済再処理ツール）では歴史的経緯で `ECFORCE_API_KEY` を使っている
-    ものもある。値の意味は同じなので、新規プロジェクトでは `ECFORCE_API_TOKEN` に
-    寄せること。
-- 失敗時の典型レスポンス：401 / 403 が返るときはトークン未設定 or 期限切れ or
-  該当 API ユーザーに権限がない。`Token token=""`（空）でもサーバーは 401 を返す。
-- ベース URL は `https://<ショップドメイン>/api/v2/admin`。**末尾スラッシュは正規化**
-  してから連結すること（`RAW_BASE_URL.replace(/\/+$/, "")` 等）。
+## 0. グローバルルール (MUST / MUST NOT)
 
-### このプロジェクトでの実装ポイント
+| #  | 種類       | ルール                                                                                                         |
+| -- | ---------- | -------------------------------------------------------------------------------------------------------------- |
+| G1 | MUST       | 認証ヘッダーは `Authorization: Token token="<TOKEN>"`。`Bearer` 不可。                                         |
+| G2 | MUST       | リクエストは逐次。並列化しない。                                                                               |
+| G3 | MUST       | 429 / 500 はリトライ。`Retry-After` ヘッダーがあれば常に優先。                                                 |
+| G4 | MUST       | ベース URL を組むときは `RAW_BASE_URL.replace(/\/+$/, "")` で末尾スラッシュを除去してから `/api/v2/admin` を連結。 |
+| G5 | MUST       | 書き込み後の検証は別 GET で行う。HTTP 200 は「ペイロードが受理された」ではなく「リクエストが届いた」しか意味しない。 |
+| G6 | MUST NOT   | `tbc` を API で書き込もうとしない (silently 無視され HTTP 200 で帰ってくる)。                                  |
+| G7 | MUST NOT   | 受注ラベル `label_ids` を API から付け外ししない (不可)。代替に `memo01` を使う。                              |
+| G8 | MUST NOT   | `bulk_update method=void` で `decrement_subs_order_times` / `recalculate_subs_order` を省略しない (定期回数が壊れる)。 |
+| G9 | MUST NOT   | `GET /orders.json` で `scheduled_to_be_shipped_at_eq=...` を使わない (datetime 型で取りこぼし)。`_gteq`+`_lt` 半開区間を使う。 |
+| G10| MUST NOT   | 顧客メモを `{ "note": {...} }` や `customer.customer_notes_attributes` で送らない。正解は `customer.notes_attributes`。 |
+| G11| MUST NOT   | `meta.total_pages` を単独で信用しない。最終ページ判定 (`data.length < per`) とハード上限を併用。              |
 
-- `process.env.ECFORCE_API_TOKEN` をそのまま使う。未設定時はそのステップを `failed`
-  にして以降を `skipped` にする（`artifacts/api-server/src/lib/jobs.ts` の
-  `SECRET_RESOLVERS.ecforce_token`）。
-- HTTP ステップに `auth_service: "ecforce"` を指定すると、実行時に
-  `Authorization: Token token="<token>"` が自動で付く。ユーザーが Authorization
-  ヘッダーを手で書く必要はなく、UI のヘッダー一覧からも隠している。
-- 旧データ互換：Authorization ヘッダーに `{{secrets.ecforce_token}}` または
-  `Token token=""`（空テンプレ）が入っている場合、GET 時に `auth_service: "ecforce"`
-  へ自動推定変換する（`inferAuthServiceFromHeader`）。リテラル値が入っているものは
-  ユーザーが意図的に静的トークンを使っている可能性があるので触らない。
+---
 
-## レスポンス形式
+## 1. 認証
 
-- ほとんどのエンドポイントは [JSON:API](https://jsonapi.org/) 形式
-  （`data` / `included` / `meta`）。
-- `data` は単一なら `JsonApiResource`、コレクションなら `JsonApiResource[]`。
-- 関連リソース（顧客の住所など）は `relationships` から id を取り、`included` 配列の
-  中から `type` + `id` で引き当てる必要がある。
+```http
+Authorization: Token token="<API_TOKEN>"
+Content-Type: application/json
+Accept: application/json
+```
 
-## エンドポイント
+| 項目             | 値                                                                       |
+| ---------------- | ------------------------------------------------------------------------ |
+| ヘッダー形式     | `Token token="<TOKEN>"` (Rails `acts_as_token_authenticatable` 系の標準) |
+| 推奨 env 名      | `ECFORCE_API_TOKEN` (歴史的経緯で `ECFORCE_API_KEY` のプロジェクトもある — 値の意味は同じ) |
+| 401 / 403 の原因 | トークン未設定 / 期限切れ / API ユーザー権限不足 / `Token token=""` 空    |
 
-### 顧客一括更新（線形検索→一括 PUT）
+このリポジトリ側の実装フック (LINE webhook 施策側):
 
-- **URL**: `PUT https://<ショップドメイン>/api/v2/admin/customers/bulk_update`
-- **用途**: LINE user id・LIFF 取得値・タグなどを ecforce 顧客に紐付ける。
-- **特徴**: 1 リクエストで複数顧客を更新できる。`customers[].id` が更新対象の
-  キー（ecforce 内部の customer_id）。
+- `process.env.ECFORCE_API_TOKEN` をそのまま参照。未設定時はそのステップを `failed` にして以降を `skipped` (`artifacts/api-server/src/lib/jobs.ts` の `SECRET_RESOLVERS.ecforce_token`)。
+- HTTP ステップで `auth_service: "ecforce"` を指定すると `Authorization` ヘッダーが自動付与され、UI の手書きヘッダー一覧からは隠れる。
+- 旧データ互換: `{{secrets.ecforce_token}}` / `Token token=""` のヘッダーは GET 時に `auth_service: "ecforce"` へ自動推定変換 (`inferAuthServiceFromHeader`)。リテラル値はユーザー意図とみなして触らない。
 
-#### 動いた最小ペイロード
+---
+
+## 2. ベース URL とレスポンス形式
+
+| 項目                  | 値                                                          |
+| --------------------- | ----------------------------------------------------------- |
+| ベース URL            | `https://<ショップドメイン>/api/v2/admin`                   |
+| レスポンス形式        | [JSON:API](https://jsonapi.org/) (`data` / `included` / `meta`) |
+| 単一リソース          | `data: JsonApiResource`                                     |
+| コレクション          | `data: JsonApiResource[]`、`included: JsonApiResource[]`    |
+| 関連リソース解決      | `relationships.<rel>.data.id` → `included` 内の同 `type`+`id` |
+
+ショップドメインの扱い:
+
+- 店舗ごとに異なる (例: `shop.example.com`)。施策ごとに保存してテンプレに差し込む。
+- このプロジェクトでは `campaign.config.shop_domains.ecforce` に保存し、
+  URL テンプレ中の `<ショップドメイン>` / `<ecforce-domain>` を実行前に差し替える
+  (`artifacts/api-server/src/routes/campaigns.ts` の `applyShopDomainsToSteps`)。
+- 入力は `https://` 付き / `/` 末尾 / 裸ドメイン のどれでも受け、`normalizeDomain` で `shop.example.com` 形式に揃える。
+
+---
+
+## 3. レート制御・タイムアウト・リトライ
+
+| 項目                       | 推奨値                       | 備考                                                              |
+| -------------------------- | ---------------------------- | ----------------------------------------------------------------- |
+| RPS                        | 0.5〜1 (= 1,000〜2,000 ms 間隔) | 書き込み比率が高いなら 2,000 ms (=0.5 RPS) 側に倒す                |
+| HTTP タイムアウト          | 30 s (`AbortController`)     |                                                                   |
+| リトライ対象               | `429`, `5xx`                  | `500` は `AOR9999` 等の一時エラーが混じるため同テーブルで扱う      |
+| リトライ間隔               | `[3s, 5s, 15s]` (最大 3 回)  | `Retry-After` ヘッダーがあれば常に優先                            |
+| HTML レスポンスのログ整形  | `<title>` だけ抜き出してログ | Cloudflare 等のブロックページで生 HTML を吐かない                  |
+
+---
+
+## 4. エンドポイント
+
+各エンドポイントは「METHOD / PATH / REQUEST / RESPONSE NOTES / RULES」で記述する。
+
+### 4-1. 顧客一括更新
+
+| 項目     | 内容                                                                   |
+| -------- | ---------------------------------------------------------------------- |
+| METHOD   | `PUT`                                                                  |
+| PATH     | `/customers/bulk_update`                                               |
+| 用途     | LINE user id / LIFF 取得値 / タグ などを ecforce 顧客に紐付ける         |
+
+REQUEST (最小):
 
 ```json
 {
   "customers": [
-    {
-      "id": "12345",
-      "link_number": "U1234567890abcdef..."
-    }
+    { "id": "12345", "link_number": "U1234567890abcdef..." }
   ]
 }
 ```
 
-- `id` は **文字列でも数値でも受け付ける**が、間違った id を投げても 200 が返ること
-  があるため「投げたら必ず取得して確認」するのが安全。
-- `link_number` は LINE user id を入れる用途で使うのが ecforce 標準。
+RULES:
 
-#### curl サンプル
+- `customers[].id` は文字列・数値どちらでも受理されるが、**文字列に統一**することで取り違え事故を防ぐ。
+- 間違った id を投げても 200 が返ることがある → 必ず別 GET で確認 (G5)。
+- `link_number` は LINE user id を入れる ecforce 標準のフィールド。
+- 差分指定 API (`upsert_xxx` / `delete_xxx`) を併用する場合、`delete_tags: []` / `delete_custom_fields: []` を **必ず空配列で明示**。指定漏れすると既存値が消える事故。
+
+curl サンプル:
 
 ```bash
 curl -X PUT "https://<ショップドメイン>/api/v2/admin/customers/bulk_update" \
   -H "Authorization: Token token=\"$ECFORCE_API_TOKEN\"" \
   -H "Content-Type: application/json" \
-  -d '{
-    "customers": [
-      { "id": "12345", "link_number": "U1234567890abcdef..." }
-    ]
-  }'
+  -d '{ "customers": [ { "id": "12345", "link_number": "U..." } ] }'
 ```
 
-### 受注検索 `GET /orders.json`
+### 4-2. 受注検索
 
-決済再処理ツールでの実運用パターン:
+| 項目     | 内容                                                                                                         |
+| -------- | ------------------------------------------------------------------------------------------------------------ |
+| METHOD   | `GET`                                                                                                        |
+| PATH     | `/orders.json`                                                                                               |
+| 用途     | 配送予定日 + 支払い方法 + 失敗系 payment_state で受注を抽出                                                  |
 
-```
-GET /api/v2/admin/orders.json?
-  include=billing_address
-  &per=100                          # per は 100 で頭打ち
-  &page=N                           # 1 始まり
-  &q[scheduled_to_be_shipped_at_gteq]=YYYY-MM-DD
-  &q[scheduled_to_be_shipped_at_lt]=YYYY-MM-DD   # 翌日
-  &q[payment_payment_method_id_eq]=58
-  &q[state_eq]=complete
-  &q[payment_state_in][]=auth_failed
-  &q[payment_state_in][]=update_failed
-  &q[payment_state_in][]=credit_exam_failed
-```
-
-#### 重要な落とし穴
-
-- `scheduled_to_be_shipped_at` は **datetime 型** なので `_eq` を使うと
-  `00:00:00` 完全一致になり、時刻成分が `00:00:00` でない受注（自動再スケジュール
-  された受注など）を取りこぼす。**必ず `_gteq` + `_lt` の半開区間で当日全体を拾う**。
-- `meta.total_pages` は欠落・`0` で返ることがある。
-  「最終ページが `per` 未満なら終了」＋「`meta.total_pages` を信頼できるなら
-  `page >= total_pages` で打ち切り」＋ハード上限（例: 1,000 ページ = 100,000 件）
-  の三段で守る。
-- `billing_address` は `relationships.billing_address.data.id` 経由で `included`
-  内の `type: "address"` を引く必要がある。氏名は `full_name`、無ければ
-  `name01 + " " + name02`。
-
-#### `payment_state` 値の対応表（運用上頻出のもの）
-
-| payment_state              | 日本語          |
-| -------------------------- | --------------- |
-| `auth_failed`              | 仮売上失敗      |
-| `update_failed`            | 取引修正失敗    |
-| `credit_exam_failed`       | 与信審査エラー  |
-| `authed`                   | 仮売上完了      |
-| `captured`                 | 売上確定        |
-| `voided`                   | 取引キャンセル  |
-| `credit_exam_completed`    | 与信審査完了    |
-| `credit_exam_processing`   | 与信審査中      |
-| `credit_exam_hold`         | 与信保留        |
-| `paid`                     | 入金済み        |
-
-### 決済再処理 `POST /orders/payment_status/bulk_update.json`
-
-決済キャンセル / 再オーソリ共通の入口。`method` で挙動が切り替わる。
-
-#### 決済キャンセル (`method=void`)
+QUERY (決済再処理ツールの例):
 
 ```
-POST /api/v2/admin/orders/payment_status/bulk_update.json
+include=billing_address
+&per=100                                          # 上限 100 で頭打ち
+&page=N                                           # 1 始まり
+&q[scheduled_to_be_shipped_at_gteq]=YYYY-MM-DD
+&q[scheduled_to_be_shipped_at_lt]=YYYY-MM-DD     # 翌日 (半開区間)
+&q[payment_payment_method_id_eq]=58
+&q[state_eq]=complete
+&q[payment_state_in][]=auth_failed
+&q[payment_state_in][]=update_failed
+&q[payment_state_in][]=credit_exam_failed
+```
+
+RULES:
+
+- `scheduled_to_be_shipped_at` は datetime 型。`_eq` 不可 (G9)。`_gteq` + `_lt` の半開区間で当日全体を拾う。
+- `per` の上限は 100。
+- ページング終了判定は次の三段で守る:
+  1. `meta.total_pages` が信頼できる (>0) なら `page >= total_pages` で終了。
+  2. 上が無いなら `data.length < per` で終了。
+  3. それでも止まらないケースに備え、ハード上限 (例: 1,000 ページ = 100,000 件)。
+- `billing_address` の氏名は `included[type=address]` を `relationships.billing_address.data.id` で引いて `full_name` → なければ `name01 + " " + name02`。
+
+### 4-3. 単一受注 GET
+
+| 項目     | 内容                                          |
+| -------- | --------------------------------------------- |
+| METHOD   | `GET`                                         |
+| PATH     | `/orders/:id.json`                            |
+| 用途     | `payment_state` 確認 / `customer_id` 取り出し |
+
+RESPONSE NOTES:
+
+- `payment_state`: `data.attributes.payment_state`
+- `customer_id` は **2 系統フォールバック必須**:
+  1. `data.attributes.customer_id` (数値 or 数字文字列)
+  2. なければ `data.relationships.customer.data.id`
+
+### 4-4. 決済再処理 (`bulk_update`)
+
+| 項目     | 内容                                              |
+| -------- | ------------------------------------------------- |
+| METHOD   | `POST`                                            |
+| PATH     | `/orders/payment_status/bulk_update.json`         |
+| 用途     | 決済キャンセル (`method=void`) / 再オーソリ (`method=reauth`) |
+
+REQUEST `method=void` (G8 必須):
+
+```json
 {
   "method": "void",
-  "order_ids": [<id>],
-  "decrement_subs_order_times": 0,   // 定期回数を -1 しない
-  "recalculate_subs_order": 0        // 定期受注を再計算しない
+  "order_ids": [12345],
+  "decrement_subs_order_times": 0,
+  "recalculate_subs_order": 0
 }
 ```
 
-- 上の 2 フラグは「単発のリカバリで定期受注を壊さない」ために**必須**。落とすと
-  定期回数や次回お届け日が意図せず動く。
+REQUEST `method=reauth` (定期保護フラグは送らない):
 
-#### 再オーソリ (`method=reauth`)
-
-```
-POST /api/v2/admin/orders/payment_status/bulk_update.json
-{ "method": "reauth", "order_ids": [<id>] }
+```json
+{ "method": "reauth", "order_ids": [12345] }
 ```
 
-- `decrement_subs_order_times` / `recalculate_subs_order` は **`reauth` では無効**
-  なので送らないこと。
+RULES:
 
-### 支払い方法変更 / 注文確定 / 受注備考
+- `void`: `decrement_subs_order_times: 0` / `recalculate_subs_order: 0` を**必ず**付ける。落とすと定期回数が `-1` され、次回お届け日が動く事故になる (G8)。
+- `reauth`: 上記 2 フラグは無効。送らない。
+- `reauth` 後は §5 のポーリングで `payment_state=credit_exam_completed` を待つ。
 
-```
-PUT /api/v2/admin/orders/:id.json
-{ "order": { "payment_attributes": { "payment_method_id": <id> } } }   # 支払い方法変更
-{ "order": { "state": "complete", "memo01": "バモス決済変更" } }       # 注文確定 + メモ
-{ "order": { "state": "wmswait" } }    # 倉庫連携待ち（FJロジ）
-{ "order": { "state": "cooolawait" } } # 倉庫連携待ち（塚本郵便逓送）
-```
+### 4-5. 受注更新 (`PUT /orders/:id`)
 
-- `memo01` (受注備考1) は **API で即書き換え可能**。再処理済みの目印（マーカー文字列）
-  として使い、ecforce 管理画面の検索条件に流用するのが定石。既存値は上書きされる。
-- `label_ids`（受注ラベル）は **API から付け外し不可**。代替に `memo01` を使う。
-- 倉庫連携待ちへの遷移は、決済が `credit_exam_completed` であることを確認したあとに
-  行うこと（早すぎると未与信のまま倉庫へ流れる）。
+| 用途                | REQUEST                                                                              |
+| ------------------- | ------------------------------------------------------------------------------------ |
+| 支払い方法変更      | `{ "order": { "payment_attributes": { "payment_method_id": <id> } } }`               |
+| 注文確定 + メモ書き | `{ "order": { "state": "complete", "memo01": "<マーカー文字列>" } }`                 |
+| 注文確定のみ        | `{ "order": { "state": "complete" } }`                                               |
+| 倉庫連携待ち遷移    | `{ "order": { "state": "wmswait" } }` / `{ "order": { "state": "cooolawait" } }`     |
 
-### 単一受注の取得 `GET /orders/:id.json`
+RULES:
 
-再オーソリ後の `payment_state` 確認や、顧客メモ追加に必要な `customer_id` 取得に使う。
+- `memo01` (受注備考1) は API で即書き換え可能。再処理済みマーカー文字列を入れて管理画面検索に使うのが定石。既存値は単純上書きされる。
+- `label_ids` (受注ラベル) は API 不可 (G7)。代替に `memo01` を使う。
+- `tbc` をペイロードに含めても **silently 無視** される (G6)。詳細は §6。
+- `wmswait` / `cooolawait` への遷移は `payment_state=credit_exam_completed` を確認したあと。
 
-- `payment_state` は `data.attributes.payment_state`。
-- `customer_id` は **2 系統フォールバック必須**:
-  1. `data.attributes.customer_id`（数値 or 数字文字列）。
-  2. なければ `data.relationships.customer.data.id`。
+`state` 値:
 
-### 顧客メモ追加 `PUT /customers/:id.json`
+| 値           | 意味                            |
+| ------------ | ------------------------------- |
+| `complete`   | 注文確定                        |
+| `wmswait`    | 倉庫連携待ち (FJロジ)           |
+| `cooolawait` | 倉庫連携待ち (塚本郵便逓送)     |
 
-公式仕様（Customer API - 顧客更新）:
+### 4-6. 顧客メモ追加
 
-```
-PUT /api/v2/admin/customers/:customer_id
+| 項目     | 内容                                          |
+| -------- | --------------------------------------------- |
+| METHOD   | `PUT`                                         |
+| PATH     | `/customers/:customer_id.json`                |
+
+REQUEST (G10 厳守):
+
+```json
 {
   "customer": {
     "notes_attributes": [
       {
         "content":     "<本文>",
-        "operated_at": "YYYY/MM/DD HH:MM:SS",   // 例: "2019/06/08 05:47:17"
-        "operated_by": <管理者ID>
+        "operated_at": "2019/06/08 05:47:17",
+        "operated_by": 12345
       }
     ]
   }
 }
 ```
 
-- `id` を指定しないと新規追加される。
-- **過去 2 回踏んだ罠**:
-  1. トップレベル `{ "note": { ... } }` で送る → strong_parameters で破棄され、
-     HTTP 200 でもメモは作成されない。
-  2. `customer.customer_notes_attributes` というキー名 → 正しくは
-     `notes_attributes`。
-- `operated_at` は公式例どおり **`YYYY/MM/DD HH:MM:SS`** （`-` ではなく `/`）。
-  Asia/Tokyo の現在時刻を
-  `Intl.DateTimeFormat("ja-JP", { timeZone: "Asia/Tokyo", … })` で作ると確実。
+RULES:
 
-## ⚠️ `tbc`（要対応）フラグは API では書き込めない
-
-これは公式ドキュメントに明示されない**最重要トラップ**。
-
-- `PUT /orders/:id.json` の `{ order: { tbc: false } }`、
-  `PUT /subs_orders/:id.json` の `{ subs_order: { tbc: false } }`、
-  `PUT /subs_orders/bulk_update.json` の `tbc` フィールド、いずれも
-  **HTTP 200 / errors=None で成功したように見えるが、再 GET すると `tbc` は元のまま**。
-- Rails の strong_parameters で silently 弾かれていると推定される（同じペイロード
-  形式で `memo01` などは persist する）。
-- **唯一の正解**: ecforce 管理画面側で **自動化ルール** を仕込み、
-  payment_state の遷移をトリガーに ecforce 自身に `tbc` を落とさせる。
-  運用中のルール例:
-  > **ルール #9**: 受注の決済状況が「与信審査完了」になったとき → 定期受注の要対応を解除する。
-- 自動化ルールは **非同期**。実測では payment_state を `credit_exam_completed` に
-  遷移させてから `GET /subs_orders/:id.json` で `tbc=false` を読み戻せるまで
-  **約 24 秒** かかる。
-- したがってクライアント側のリカバリは **GET ポーリングで反映を待つ**。
-  ラウンド方式（受注 1 件単位ではなくバッチ末尾に集約）が運用上効率的:
+- 正しいキー名は `customer.notes_attributes`。以下は **すべて silently 無視される** (HTTP 200 だがメモは作成されない):
+  - トップレベル `{ "note": {...} }`
+  - `customer.customer_notes_attributes`
+- `operated_at` は **`YYYY/MM/DD HH:MM:SS`** (区切りは `/`)。Asia/Tokyo:
+  ```ts
+  new Intl.DateTimeFormat("ja-JP", {
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+    hour12: false, timeZone: "Asia/Tokyo",
+  }).formatToParts(new Date());
   ```
-  round 1: wait 0s  → 全件 GET
-  round 2: wait 5s  → 未反映分のみ GET
-  round 3: wait 10s → 未反映分のみ GET
-  round 4: wait 15s → 未反映分のみ GET   (累計 30s)
-  ```
-- `tbc` の真偽判定は防御的に: `false / 0 / "false" / "0" / null / undefined` を
-  すべて「解除済み」とみなす（ecforce が型を揺らすため）。
+- `id` を省略すると新規追加。
 
-### 偽陰性（false negative）事例
+---
 
-本番ログで 22 件中 8 件が「tbc 解除未反映」とエラーになったが、後刻 GET し直すと
-**全件 `tbc=false`** だった。原因は (1) 無効な PUT を投げていた、(2) 反映遅延を
-待ち切れていなかった、の 2 点。上記ラウンド方式で恒久対応。
+## 5. 与信審査ポーリング (`reauth` 後)
 
-## 再オーソリ後の与信審査ポーリング
+`reauth` 直後の `payment_state` はほぼ `credit_exam_processing`。完了まで数秒〜十数秒の遅延あり。
 
-`reauth` 直後の `payment_state` は `credit_exam_processing` （与信審査中）であることが
-多く、`credit_exam_completed` まで数秒〜十数秒の遅延がある。
+手順:
 
-推奨パターン:
-
-1. `reauth` 後に固定で **5 秒** 待機（`POST_REAUTH_INITIAL_WAIT_MS=5000`）。
+1. `reauth` 後に **5,000 ms** 固定待機 (`POST_REAUTH_INITIAL_WAIT_MS`)。
 2. `GET /orders/:id.json` でポーリング:
    - `credit_exam_completed` → 成功。
-   - `credit_exam_processing` → **2 秒 sleep** 後にリトライ（最大 15 回 ≈ 30 秒、
-     `VERIFY_POLL_INTERVAL_MS=2000` / `VERIFY_POLL_MAX_ATTEMPTS=15`）。
-   - それ以外（`credit_exam_failed` 等）→ 与信審査エラーとして上位で分岐。
+   - `credit_exam_processing` → 2,000 ms sleep → リトライ (最大 15 回 ≈ 30 s)。
+   - それ以外 (`credit_exam_failed` 等) → 与信審査エラーとして上位でリカバリ分岐。
 
-### 旧形式エラー文言にも要注意
+旧形式エラーメッセージにも注意:
 
-ecforce のバージョンによっては「与信審査完了でない」状態を以下のような **エラー
-メッセージ文字列** で返すことがある:
+- 「決済状況が credit_exam_completed ではありません…」という**文字列**で返るケースがある。
+- 値だけで判定すると分岐に流れないので、上記文字列も `credit_exam_failed` 相当として扱う。
 
-> 「決済状況が credit_exam_completed ではありません…」
+---
 
-これも `credit_exam_failed` 相当として扱うこと（純粋な状態値だけ見ているとリカバリ
-パスが起動しない事故になる）。
+## 6. `tbc` (要対応) は API で書き込めない【最重要】
 
-## ショップドメイン
+| 項目                  | 内容                                                                                       |
+| --------------------- | ------------------------------------------------------------------------------------------ |
+| 書き込み可否          | **不可** (HTTP 200 で帰るが silently 無視。再 GET すると値は変わっていない)                |
+| 対象ペイロード        | `PUT /orders/:id` の `order.tbc` / `PUT /subs_orders/:id` の `subs_order.tbc` / `PUT /subs_orders/bulk_update.json` の `tbc` すべて |
+| 原因 (推定)           | Rails strong_parameters で silently 弾かれている (同形式で `memo01` は persist する)        |
+| 解決策                | 管理画面の **自動化ルール** + GET ポーリングで反映を待つ                                  |
 
-- 「ショップドメイン」は店舗ごとに違う（例: `shop.example.com`）。施策ごとに保存して
-  テンプレートに差し込む運用にする。
-- このプロジェクトでは campaign の `config.shop_domains.ecforce` に保存し、
-  テンプレ URL の `<ショップドメイン>` / `<ecforce-domain>` プレースホルダを
-  実行前に差し替えている（`artifacts/api-server/src/routes/campaigns.ts` の
-  `applyShopDomainsToSteps`）。
-- 入力は `https://` 付き / `/` 末尾付き / 裸ドメイン のどれでも受け、`normalizeDomain`
-  で `shop.example.com` 形式に揃える。
+運用中の自動化ルール例 (実機確認済み):
 
-## レート制限・タイムアウト・リトライ
+> **ルール #9**: 受注の決済状況が「与信審査完了」になったとき → 定期受注の要対応を解除する
 
-- ecforce 公式の RPS は非公開。経験則:
-  - **1 RPS 程度に絞ると安定**（webhook 施策側ではこちらで運用中）。
-  - 決済再処理ツール側では **リクエスト間隔の下限を 2,000 ms（=0.5 RPS）** に置いた
-    ところ 429 がほぼ消えた。`bulk_update` 系を含む書き込み比率が高い場合は
-    こちらの設定の方が安全。
-- バーストすると 502 / 504 / Cloudflare の遮断が時々起きる。並列化はせず**逐次**で
-  叩くこと（ecforce 側の負荷を上げない）。
-- HTTP は `AbortController` で 30 秒タイムアウト推奨。
-- **429 / 500 リトライ**:
-  - 5xx / 429 は指数バックオフでリトライ（webhook 側 `HostRateLimiter` ＋
-    `WEBHOOK_HTTP_DEFAULT_MAX_RETRIES`）。
-  - 決済再処理ツールでの実運用値: **試行ごとの待機 `[3s, 5s, 15s]`、最大 3 回**。
-  - `Retry-After` ヘッダーがあれば常に優先。
-  - 500 系は `AOR9999` のような一時的内部エラーが混じるので、429 と同じテーブルで
-    リトライ対象に含めている。
-- レスポンスが HTML（Cloudflare のブロックページ等）で返ったら、`<title>` だけ
-  抜き出してログに残す（生 HTML を吐くとログが汚れる）。
+特性:
 
-## ペイロードのテンプレート化
+| 項目                  | 値                                       |
+| --------------------- | ---------------------------------------- |
+| トリガー              | `payment_state` → `credit_exam_completed` |
+| 実行                  | 非同期                                   |
+| 反映遅延 (実測)       | ≈24 秒                                   |
+| 確認方法              | `GET /subs_orders/:id.json` の `tbc`     |
 
-- このプロジェクトのテンプレ施策 `line_ecforce_repeatline` では受信 webhook
-  ペイロードから ecforce 顧客 id と LINE user id を取り出して投げている：
+クライアント側のラウンド方式 GET ポーリング:
+
+```
+round 1: wait  0 s → 対象全件 GET
+round 2: wait  5 s → 未反映分のみ GET
+round 3: wait 10 s → 未反映分のみ GET
+round 4: wait 15 s → 未反映分のみ GET   (累計 30 s)
+```
+
+`tbc` の真偽判定は防御的に。以下はすべて「解除済み」とみなす:
+
+```ts
+tbc === false || tbc === 0 || tbc === "false" || tbc === "0" || tbc === null || tbc === undefined
+```
+
+過去の偽陰性事例: 本番ログで 22 件中 8 件が「tbc 解除未反映」エラーになったが、
+後刻 GET し直すと全件 `tbc=false`。原因は (1) 無効な PUT を投げていた、
+(2) 反映遅延を待ち切れていなかった、の 2 点。両方とも上記設計で解消。
+
+---
+
+## 7. `payment_state` 値辞書
+
+| `payment_state`            | 日本語          | リカバリ対象? |
+| -------------------------- | --------------- | ------------- |
+| `auth_failed`              | 仮売上失敗      | ✅            |
+| `update_failed`            | 取引修正失敗    | ✅            |
+| `credit_exam_failed`       | 与信審査エラー  | ✅            |
+| `credit_exam_processing`   | 与信審査中      | ポーリング継続 |
+| `credit_exam_hold`         | 与信保留        | -             |
+| `credit_exam_completed`    | 与信審査完了    | -             |
+| `authed`                   | 仮売上完了      | -             |
+| `captured`                 | 売上確定        | -             |
+| `voided`                   | 取引キャンセル  | -             |
+| `paid`                     | 入金済み        | -             |
+
+---
+
+## 8. 推奨ステップ設計 (決済再処理ツール: NP → バモス 切替)
+
+成功パスと自動リカバリパスを併記。
+
+```
+① 対象抽出          GET /orders.json (§4-2)
+② 決済キャンセル     POST bulk_update method=void (§4-4)
+③ 支払い方法変更    PUT /orders/:id payment_attributes (§4-5)
+④ 再オーソリ        POST bulk_update method=reauth (§4-4)
+⑤ 与信審査完了確認  GET /orders/:id でポーリング (§5)
+   ├─ credit_exam_completed → 成功パス ⑥ へ
+   └─ credit_exam_failed / 旧文言 → リカバリパス R1 へ
+⑥ 注文確定 + メモ   PUT /orders/:id { state:"complete", memo01:"<マーカー>" } (§4-5)
+⑦ 倉庫連携待ち遷移  PUT /orders/:id { state:"wmswait"|"cooolawait" } (§4-5)
+⑧ 顧客メモ追加      PUT /customers/:id notes_attributes (§4-6)
+⑨ バッチ末尾検証    GET /subs_orders/:id tbc ラウンドポーリング (§6)
+```
+
+リカバリパス R1 (④ が `credit_exam_failed` のとき):
+
+```
+R1-1 決済キャンセル        POST bulk_update method=void
+R1-2 支払い方法を戻す      PUT /orders/:id payment_attributes (元の方法)
+R1-3 再オーソリ            POST bulk_update method=reauth
+R1-4 与信審査完了確認      GET /orders/:id ポーリング
+R1-5 注文確定のみ          PUT /orders/:id { state:"complete" }  ← tbc は触らない
+                          (ルール #9 は発火しないので「要対応」は維持され、人間レビュー待ちになる — これが正しい挙動)
+```
+
+---
+
+## 9. ペイロードのテンプレート化 (LINE webhook 施策側)
+
+テンプレ施策 `line_ecforce_repeatline` の例:
 
 ```json
 {
@@ -320,105 +389,47 @@ ecforce のバージョンによっては「与信審査完了でない」状態
 }
 ```
 
-- `{{payload.foo.bar}}` 形式の自前テンプレートエンジン。配列添字も可。値が非文字列
-  なら `JSON.stringify` される。
+- `{{payload.foo.bar}}` 形式の自前テンプレートエンジン。配列添字 (`foo.0.bar`) も可。
+- 値が非文字列なら `JSON.stringify` される。
 - `{{secrets.ecforce_token}}` は実行時に環境変数のトークンに置換される。
 
-## 推奨される処理ステップ設計（決済再処理ツール例: NP → バモス 切替）
+---
 
-成功パスと自動リカバリパスを併記:
+## 10. デバッグ手順
 
-1. **対象抽出**: 配送予定日 + `payment_method=58` + 失敗系 `payment_state` で検索。
-2. **① 決済キャンセル** (`bulk_update method=void`, 定期保護フラグ 0 / 0)。
-3. **② 支払い方法変更** (`PUT /orders/:id`, `payment_method_id` を切替先へ)。
-4. **③ 再オーソリ** (`bulk_update method=reauth`)。
-5. **④ 与信審査完了確認** (5s 初期待機 → 2s ポーリング)。
-   - `credit_exam_completed` → 成功パスへ。
-   - `credit_exam_failed`（旧文言含む）→ **自動リカバリパスへ分岐**。
-6. **⑤ 注文確定 + メモ書き込み** (`state=complete, memo01="<マーカー>"`)。
-   - 注意: `tbc` は送らない（送っても無視される）。
-   - 同時に ecforce 側の自動化ルール #9 が非同期で `tbc` をクリアし始める。
-7. **⑥ 倉庫連携待ちへ遷移** (`state=wmswait` or `cooolawait`)。
-8. **⑦ 顧客メモ追加** (`notes_attributes` で追記)。
-9. **⑧ バッチ末尾で `subs_order.tbc` の反映をラウンド方式 GET ポーリング** で検証。
+1. `curl` で素のリクエストが通るか確認。401 ならトークン / 権限。
+2. テンプレ化されたボディはサーバーログで置換後の値を確認 (テンプレ置換ミスがいちばん多い)。
+3. ecforce 管理画面の対象リソース詳細で実反映を確認 (HTTP 200 = 反映、ではない: G5)。
+4. `tbc` 系で「反映されない」と言われたらまず `GET /subs_orders/:id.json` を `[0, 5, 10, 15]` 秒の累計 30 s スパンで叩き直す (§6)。
 
-### 自動リカバリパス（④ が credit_exam_failed のとき）
+---
 
-切替後の決済をキャンセルし、元の支払い方法に戻して再オーソリ → 与信審査完了確認 →
-**「注文確定のみ」（要対応フラグは維持し、人間レビューに回す）**。
-このとき `state=complete` のみを PUT し、`tbc` は触らない（自動化ルール #9 は
-発火しないので、要対応は維持される — これが正しい挙動）。
+## 11. 参考実装
 
-## よくある落とし穴
-
-- **`Bearer` で送ってしまう**：他社 API の癖で `Bearer <token>` を書きがちだが
-  ecforce は受け付けない。必ず `Token token="<token>"`。
-- **id を数値か文字列か混在させる**：JSON 上はどちらでも通るが、ecforce 側の
-  customer_id が文字列前提のショップだと予期しない一致になりうる。文字列に統一推奨。
-- **空トークンで送る**：`Token token=""` も 200 を返す API が一部あるが大半は 401。
-  デプロイ後に「なぜか動かない」のだいたい 7 割はこれ。Secrets タブで設定後は
-  API サーバー再起動を忘れない。
-- **タグ・カスタムフィールドの全件消し**：差分指定 API（upsert_xxx / delete_xxx）で
-  delete を空配列にせず指定漏れすると既存値が消えるケースがある。雛形では
-  必ず `delete_tags: []` `delete_custom_fields: []` を明示する。
-- **Cloudflare の WAF**：日本語 UA や空 UA で時々 1020 / 403 を返す。
-  `User-Agent` を明示するとマシになる。
-- **HTTPS 必須**：`http://` で叩くとリダイレクトが返るだけでなく Cookie が落ちて
-  認証セッション扱いになるケースがあるので必ず `https://`。
-- **`scheduled_to_be_shipped_at_eq` で日付絞り込み**：datetime 型なので
-  `00:00:00` 完全一致になり取りこぼす。`_gteq` + `_lt` の半開区間で当日全体を拾う。
-- **`bulk_update void` で定期保護フラグを送り忘れる**：定期回数が `-1` され、
-  次回お届け日が動く事故になる。`decrement_subs_order_times: 0` /
-  `recalculate_subs_order: 0` を必ず付ける（`reauth` では逆に送らない）。
-- **`tbc` を API で書こうとする**：silently 無視される。GET ポーリング + 自動化
-  ルール側で解消する設計に倒す。
-- **顧客メモを `note` トップレベルや `customer_notes_attributes` で送る**：
-  HTTP 200 でもメモは作成されない。正しいキーは
-  `customer.notes_attributes[]`。
-- **受注ラベル (`label_ids`) を API から付け外ししようとする**：不可。`memo01`
-  でマーカー文字列を書いて検索に流用する。
-- **`meta.total_pages` を盲信する**：欠落・0 が混じる。最終ページ判定とハード
-  上限の両方でガードする。
-
-## デバッグ手順
-
-1. まず `curl` で素のリクエストが通るか。401 ならトークン or 権限の問題。
-2. 通ったら body に `{{...}}` を入れて、サーバーログのリクエストペイロードを確認。
-   テンプレ置換後の値が想定どおりかを最優先で見る。
-3. ecforce 側で更新されたかは ecforce 管理画面の顧客詳細を直接確認。
-   API が 200 を返しても反映タイミングのズレで一見更新されないことがある。
-4. **`tbc` 系で「反映されない」と言われたら**まず `GET /subs_orders/:id.json` を
-   `[0, 5, 10, 15]` 秒の累計 30 秒スパンで叩き直す。自動化ルール経由なので
-   即時反映ではない。
-
-## このプロジェクトを参考にしたい場合
+LINE webhook 施策側 (このリポジトリの周辺コード):
 
 - `artifacts/api-server/src/lib/jobs.ts` — シークレット解決・認証ヘッダー自動付与
 - `artifacts/api-server/src/routes/campaigns.ts` — テンプレ施策生成・ドメイン差し込み
 - `artifacts/api-server/src/routes/app-settings.ts` — `ECFORCE_API_TOKEN` の有無判定
 
-### 決済再処理ツール側のリファレンス実装
+決済再処理ツール側:
 
-別プロジェクト「ecforce 決済再処理ツール」での実装例:
+- `artifacts/api-server/src/lib/ecforceClient.ts` — 認証 / 2,000 ms レート制御 / `[3s,5s,15s]` リトライ / `getTargetOrders` の半開区間ページング / `bulk_update` (void / reauth) / `PUT /orders/:id` (支払い方法変更・注文確定・倉庫連携待ち) / `getSubscriptionTbc` / `addCustomerNote` 公式仕様準拠
+- `artifacts/api-server/src/lib/postVerify.ts` — バッチ末尾の `tbc` ラウンド GET ポーリングで「成功確定 / 失敗降格」を切り替える純粋ロジック
+- `artifacts/api-server/src/routes/orders.ts` — 上記を組み合わせた ①〜⑨ オーケストレーションと `credit_exam_failed` 検出時の R1 分岐
 
-- `artifacts/api-server/src/lib/ecforceClient.ts` — 認証ヘッダー / 2,000ms レート制御 /
-  `[3s, 5s, 15s]` リトライ / `getTargetOrders` の半開区間ページング / `bulk_update`
-  (void / reauth) / `PUT /orders/:id` (支払い方法変更・注文確定・倉庫連携待ち) /
-  `getSubscriptionTbc` / `addCustomerNote` 公式仕様準拠ペイロード。
-- `artifacts/api-server/src/lib/postVerify.ts` — バッチ末尾の `tbc` ラウンド方式
-  GET ポーリングで「成功確定 / 失敗降格」を切り替える純粋ロジック。
-- `artifacts/api-server/src/routes/orders.ts` — 上記を組み合わせた ① 〜 ⑧ ステップ
-  オーケストレーションと、`credit_exam_failed` 検出時の自動リカバリ分岐。
+---
 
-## 参考: 関連定数（決済再処理ツール実装値）
+## 12. 定数表 (決済再処理ツール実装値)
 
 | 名前                                  | 値                              | 用途                                                       |
 | ------------------------------------- | ------------------------------- | ---------------------------------------------------------- |
-| `RATE_LIMIT_MS`                       | 2000                            | リクエスト間隔の下限                                       |
+| `RATE_LIMIT_MS`                       | `2000`                          | リクエスト間隔の下限                                       |
 | `RETRY_DELAYS_MS`                     | `[3000, 5000, 15000]`           | 429 / 500 リトライ間隔                                     |
-| `PAGE_SIZE`                           | 100                             | `per` パラメータ（ecforce 側上限）                         |
-| `MAX_PAGES`                           | 1000                            | 受注検索の安全上限（=最大 100,000 件）                     |
-| `POST_REAUTH_INITIAL_WAIT_MS`         | 5000                            | 再オーソリ後の初期待機                                     |
-| `VERIFY_POLL_INTERVAL_MS`             | 2000                            | 与信審査完了ポーリング間隔                                 |
-| `VERIFY_POLL_MAX_ATTEMPTS`            | 15                              | 与信審査完了ポーリング最大試行                             |
+| `RETRY_MAX_ATTEMPTS`                  | `3`                             | 429 / 500 リトライ最大試行                                 |
+| `PAGE_SIZE`                           | `100`                           | `per` パラメータ (ecforce 側上限)                          |
+| `MAX_PAGES`                           | `1000`                          | 受注検索の安全上限 (= 最大 100,000 件)                     |
+| `POST_REAUTH_INITIAL_WAIT_MS`         | `5000`                          | 再オーソリ後の初期待機                                     |
+| `VERIFY_POLL_INTERVAL_MS`             | `2000`                          | 与信審査完了ポーリング間隔                                 |
+| `VERIFY_POLL_MAX_ATTEMPTS`            | `15`                            | 与信審査完了ポーリング最大試行                             |
 | `POST_BATCH_TBC_RETRY_DELAYS_MS`      | `[0, 5000, 10000, 15000]`       | バッチ末尾 `tbc` 反映ラウンドの待機列                      |
